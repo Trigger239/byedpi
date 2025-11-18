@@ -89,11 +89,13 @@ struct eval {
     
     bool restore_ttl;
     bool restore_md5;
-    char *restore_fake;
-    size_t restore_fake_len;
+    bool restore_fake;
+    int restore_fake_fd;
     const char *restore_orig;
     size_t restore_orig_len;
     unsigned int part_sent;
+    ssize_t total_sent;
+    struct eval **tmp_file_val;
 };
 
 struct poolhd {

@@ -11,6 +11,7 @@
     #include <sys/time.h>
     #include <sys/socket.h>
     #include <sys/mman.h>
+    #include <sys/sendfile.h>
     #include <arpa/inet.h>
     #include <fcntl.h>
     
@@ -97,8 +98,7 @@ static bool sock_has_notsent(int sfd)
 
 static char *alloc_pktd(size_t n)
 {
-    char *p = mmap(0, n, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
-    return p == MAP_FAILED ? 0 : p;
+    return malloc(n);
 }
 #else
 #define sock_has_notsent(sfd) 0
@@ -193,52 +193,131 @@ static int set_md5sig(int sfd, unsigned short key_len)
 }
 
 
-static ssize_t send_fake(struct eval *val, const char *buffer,
-        long pos, const struct desync_params *opt, struct packet pkt)
+#define MAX_TF 10
+
+struct tf_s {
+    int fd;
+    struct eval *val;
+    ssize_t end_pos;
+};
+
+int tf_count = 0;
+static struct tf_s tf_exems[MAX_TF] = { 0 };
+
+static int64_t sock_get_acked(int sfd)
 {
-    int fds[2];
-    if (pipe(fds) < 0) {
-        uniperror("pipe");
+    struct tcp_info tcpi;
+    socklen_t ts = sizeof(tcpi);
+
+    if (getsockopt(sfd, IPPROTO_TCP, TCP_INFO, (char *)&tcpi, &ts) < 0) {
+        perror("getsockopt TCP_INFO");
         return -1;
     }
-    size_t ms = pos > pkt.size ? pos : pkt.size;
-    ssize_t ret = -1;
+    if (tcpi.tcpi_state != 1) {
+        LOG(LOG_E, "state: %d\n", tcpi.tcpi_state);
+        return -1;
+    }
+    if (ts <= offsetof(struct tcp_info, tcpi_bytes_acked)) {
+        LOG(LOG_E, "tcpi_bytes_acked not provided\n");
+        return -1;
+    }
+    return tcpi.tcpi_bytes_acked;
+}
+
+static struct tf_s *get_tfe(void)
+{
+    struct tf_s *s = 0;
+    if (tf_count < MAX_TF) {
+        s = &tf_exems[tf_count];
+    }
+    else {
+        for (int i = 0; i < MAX_TF; i++) {
+            struct tf_s *ss = &tf_exems[i];
+            if (!ss->val) {
+                s = ss;
+                break;
+            }
+            int64_t acked = sock_get_acked(ss->val->fd);
+            if (acked >= ss->end_pos) {
+                LOG(LOG_S, "tmp: done: fd=%d\n", ss->fd);
+                ss->val->tmp_file_val = 0;
+                s = ss;
+                break;
+            }
+        }
+        if(s && s->fd >= 0){
+           LOG(LOG_S, "tmp: close: fd=%d\n", s->fd);
+           close(s->fd);
+        }
+    }
+    if (s) memset(s, 0, sizeof(*s));
+    return s;
+}
+
+static ssize_t send_fake(struct eval *val, const char *buffer,
+        long pos, long sent_pos, const struct desync_params *opt, struct packet pkt)
+{
+    struct tf_s *s = get_tfe();
+    if (!s) {
+        return ERR_WAIT;
+    }
+
+    int tmp_fd = open("/tmp", O_TMPFILE | O_RDWR);
+    if (tmp_fd < 0) {
+        uniperror("open");
+        s->fd = -1;
+        return -1;
+    }
+    LOG(LOG_S, "tmp: open: fd=%d\n", tmp_fd);
+    s->fd = tmp_fd;
+    s->val = val;
+
+    ssize_t len = -1, ps = pkt.size - pkt.off;
     
     val->restore_orig = buffer;
     val->restore_orig_len = pos;
-    
+
     while (1) {
-        char *p = pkt.data + pkt.off;
-        val->restore_fake = p;
-        val->restore_fake_len = pkt.size;
-        
+        ssize_t wrtcnt = 0;
+        wrtcnt = write(tmp_fd, pkt.data + pkt.off, ps < pos ? ps : pos);
+        if (wrtcnt < 0) {
+            uniperror("write");
+            break;
+        }
+        if (ps < pos) {
+            if (ftruncate(tmp_fd, pos) < 0) {
+                uniperror("ftruncate");
+                break;
+            }
+        }
+        if (lseek(tmp_fd, 0, SEEK_SET) < 0) {
+            uniperror("lseek");
+            break;
+        }
         if (setttl(val->fd, opt->ttl ? opt->ttl : DEFAULT_TTL) < 0) {
             break;
         }
         val->restore_ttl = 1;
-        if (opt->md5sig && set_md5sig(val->fd, 5)) {
+        if (sendfile(val->fd, tmp_fd, NULL, pos) < 0) {
+            uniperror("sendfile");
             break;
         }
-        val->restore_md5 = opt->md5sig;
-        
-        struct iovec vec = { .iov_base = p, .iov_len = pos };
-        
-        ssize_t len = vmsplice(fds[1], &vec, 1, SPLICE_F_GIFT);
-        if (len < 0) {
-            uniperror("vmsplice");
-            break;
-        }
-        len = splice(fds[0], 0, val->fd, 0, len, 0);
-        if (len < 0) {
-            uniperror("splice");
-            break;
-        }
-        ret = len;
+
+        val->restore_fake = 1;
+        val->restore_fake_fd = tmp_fd;
+
+        len = pos;
+        s->end_pos = val->total_sent + sent_pos + pos;
+        val->tmp_file_val = &s->val;
+        if (tf_count < MAX_TF) tf_count++;
         break;
     }
-    close(fds[0]);
-    close(fds[1]);
-    return ret;
+    if (len < 0) {
+        LOG(LOG_S, "tmp: close: fd=%d\n", tmp_fd);
+        close(tmp_fd);
+        s->fd = -1;
+    }
+    return len;
 }
 #endif
 
@@ -300,10 +379,10 @@ static HANDLE openTempFile(void)
     return hfile;
 }
 
-    
 static ssize_t send_fake(struct eval *val, const char *buffer,
-        long pos, const struct desync_params *opt, struct packet pkt)
+        long pos, long sent_pos, const struct desync_params *opt, struct packet pkt)
 {
+    (void) sent_pos; // unused
     struct tf_s *s = getTFE();
     if (!s) {
         return ERR_WAIT;
@@ -378,9 +457,16 @@ static void restore_state(struct eval *val)
 {
     #ifdef __linux__
     if (val->restore_fake) {
-        memcpy(val->restore_fake, 
-            val->restore_orig, val->restore_orig_len);
-        munmap(val->restore_fake, val->restore_fake_len);
+        do {
+            if (lseek(val->restore_fake_fd, 0, SEEK_SET) < 0) {
+                uniperror("restore: lseek");
+                break;
+            }
+            if (write(val->restore_fake_fd, val->restore_orig, val->restore_orig_len) < 0) {
+                 uniperror("restore: write");
+                 break;
+            }
+        } while (0);
         val->restore_fake = 0;
     }
     if (val->restore_md5) {
@@ -593,10 +679,8 @@ ssize_t desync(struct poolhd *pool,
                     return -1;
                 }
                 if (pos != lp) s = send_fake(val, 
-                    buffer + lp, pos - lp, &dp, pkt);
-                #ifndef __linux
+                    buffer + lp, pos - lp, lp - offset + skip, &dp, pkt);
                 free(pkt.data);
-                #endif
                 break;
             #endif
             case DESYNC_OOB:

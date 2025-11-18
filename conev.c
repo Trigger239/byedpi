@@ -100,16 +100,16 @@ void del_event(struct poolhd *pool, struct eval *val)
         buff_push(pool, val->sq_buff);
         val->sq_buff = 0;
     }
-    #ifndef _WIN32
-    if (val->restore_fake) {
-        munmap(val->restore_fake, val->restore_fake_len);
-        val->restore_fake = 0;
-    }
-    #endif
     if (val->host) {
         free(val->host);
         val->host = 0;
     }
+    #ifdef __linux__
+    if (val->tmp_file_val) {
+        *val->tmp_file_val = 0;
+        val->tmp_file_val = 0;
+    }
+    #endif
     close(val->fd);
     val->fd = -1;
     val->mod_iter = pool->iters;

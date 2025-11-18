@@ -755,6 +755,7 @@ int on_udp_tunnel(struct poolhd *pool, struct eval *val, int et)
         if (val->round_sent == 0) {
             val->round_count++;
             val->round_sent += n;
+            val->total_sent += n;
             pair->round_sent = 0;
         }
         ssize_t ns;

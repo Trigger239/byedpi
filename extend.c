@@ -183,6 +183,7 @@ static int reconnect(struct poolhd *pool, struct eval *val)
     client->buff->offset = 0;
     client->round_sent = 0;
     client->part_sent = 0;
+    client->total_sent = 0;
     return 0;
 }
 
@@ -531,6 +532,7 @@ ssize_t tcp_send_hook(struct poolhd *pool,
         }
     }
     remote->pair->round_sent += sn;
+    remote->pair->total_sent += sn;
     return sn;
 }
 
